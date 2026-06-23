@@ -199,7 +199,13 @@ void websocket_connection_ssl::on_read(beast::error_code ec, size_t bytes_transf
 
     if (ec)
     {
-        g_RipExt.LogError("WebSocket read error: %d %s", ec.value(), ec.message().c_str());
+        if (!this->pending_delete.load(std::memory_order_acquire) &&
+            ec != boost::asio::error::operation_aborted &&
+            ec.value() != 995 &&
+            ec.value() != 1236)
+        {
+            g_RipExt.LogError("WebSocket read error: %d %s", ec.value(), ec.message().c_str());
+        }
         this->notify_disconnect();
         this->ws_connect.store(false, std::memory_order_release);
         return;
@@ -233,7 +239,13 @@ void websocket_connection_ssl::on_close(beast::error_code ec)
 
     if (ec)
     {
-        g_RipExt.LogError("WebSocket close error: %s", ec.message().c_str());
+        if (!this->pending_delete.load(std::memory_order_acquire) &&
+            ec != boost::asio::error::operation_aborted &&
+            ec.value() != 995 &&
+            ec.value() != 1236)
+        {
+            g_RipExt.LogError("WebSocket close error: %d %s", ec.value(), ec.message().c_str());
+        }
     }
     this->ws_connect.store(false, std::memory_order_release);
     this->close_in_progress.store(false, std::memory_order_release);
@@ -296,6 +308,18 @@ void websocket_connection_ssl::cancel()
 
         // Cancel all pending async operations first
         stream.cancel();
+
+        if (this->pending_delete.load(std::memory_order_acquire))
+        {
+            if (stream.socket().is_open())
+            {
+                stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                stream.socket().close(ec);
+            }
+            this->ws_connect.store(false, std::memory_order_release);
+            this->close_in_progress.store(false, std::memory_order_release);
+            return;
+        }
 
         if (this->ws->is_open())
         {

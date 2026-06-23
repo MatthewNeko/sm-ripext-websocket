@@ -291,6 +291,8 @@ bool RipExt::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 void RipExt::SDK_OnUnload()
 {
+	unloaded.store(true);
+
 	uv_async_send(&g_AsyncStopLoop);
 	uv_thread_join(&g_Thread);
 	uv_loop_close(g_Loop);
@@ -307,8 +309,6 @@ void RipExt::SDK_OnUnload()
 	smutils->RemoveGameFrameHook(&FrameHook);
 
 	event_loop.OnExtUnload();
-
-	unloaded.store(true);
 }
 
 void RipExt::AddRequestToQueue(IHTTPContext *context)
@@ -338,6 +338,11 @@ void log_err(void *msg)
 
 void RipExt::LogMessage(const char *msg, ...)
 {
+	if (unloaded.load())
+	{
+		return;
+	}
+
 	char *buffer = reinterpret_cast<char *>(malloc(3072));
 	va_list vp;
 	va_start(vp, msg);
@@ -349,6 +354,11 @@ void RipExt::LogMessage(const char *msg, ...)
 
 void RipExt::LogError(const char *msg, ...)
 {
+	if (unloaded.load())
+	{
+		return;
+	}
+
 	char *buffer = reinterpret_cast<char *>(malloc(3072));
 	va_list vp;
 	va_start(vp, msg);
@@ -361,11 +371,21 @@ void RipExt::LogError(const char *msg, ...)
 void execute_cb(void *cb)
 {
 	std::unique_ptr<std::function<void()>> callback(reinterpret_cast<std::function<void()> *>(cb));
+	if (unloaded.load())
+	{
+		return;
+	}
+
 	callback->operator()();
 }
 
 void RipExt::Defer(std::function<void()> callback)
 {
+	if (unloaded.load())
+	{
+		return;
+	}
+
 	std::unique_ptr<std::function<void()>> cb = std::make_unique<std::function<void()>>(callback);
 	smutils->AddFrameAction(&execute_cb, cb.release());
 }
