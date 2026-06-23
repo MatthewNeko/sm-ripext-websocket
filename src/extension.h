@@ -46,9 +46,10 @@ class IHTTPContext
 public:
 	virtual bool InitCurl() = 0;
 	virtual void OnCompleted() = 0;
+	virtual bool HasPendingCallbacks() { return false; }
 	virtual ~IHTTPContext() {}
 
-	CURL *curl;
+	CURL *curl = nullptr;
 };
 
 struct CurlContext
@@ -147,7 +148,7 @@ public:
 	// virtual bool QueryRunning(char *error, size_t maxlength);
 	virtual void LogMessage(const char *msg, ...);
 	virtual void LogError(const char *msg, ...);
-	virtual void Defer(std::function<void()> callback);
+	virtual bool Defer(std::function<void()> callback);
 
 public:
 #if defined SMEXT_CONF_METAMOD

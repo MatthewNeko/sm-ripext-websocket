@@ -152,25 +152,31 @@ void HTTPFileContext::OnCompleted()
 	forward->Execute(nullptr);
 }
 
+bool HTTPFileContext::HasPendingCallbacks()
+{
+	return pendingCallbacks.load(std::memory_order_acquire) != 0;
+}
+
 void HTTPFileContext::setProgressData(curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
 {
-	this->dltotal = dltotal;
-	this->dlnow = dlnow;
-	this->ultotal = ultotal;
-	this->ulnow = ulnow;
 	if (dltotal != 0 || ultotal != 0)
 	{
-		g_RipExt.Defer([this](){
+		pendingCallbacks.fetch_add(1, std::memory_order_acq_rel);
+		if (!g_RipExt.Defer([this, dltotal, dlnow, ultotal, ulnow](){
 			if (this->progressForward && this->progressForward->GetFunctionCount() != 0)
 			{
 				this->progressForward->PushCell(this->isUpload);
-				this->progressForward->PushCell((cell_t)this->dltotal);
-				this->progressForward->PushCell((cell_t)this->dlnow);
-				this->progressForward->PushCell((cell_t)this->ultotal);
-				this->progressForward->PushCell((cell_t)this->ulnow);
+				this->progressForward->PushCell((cell_t)dltotal);
+				this->progressForward->PushCell((cell_t)dlnow);
+				this->progressForward->PushCell((cell_t)ultotal);
+				this->progressForward->PushCell((cell_t)ulnow);
 				this->progressForward->Execute(nullptr);
 			}
-		});
+			pendingCallbacks.fetch_sub(1, std::memory_order_acq_rel);
+		}))
+		{
+			pendingCallbacks.fetch_sub(1, std::memory_order_acq_rel);
+		}
 	}
 }
 

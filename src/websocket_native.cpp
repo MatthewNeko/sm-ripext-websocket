@@ -83,18 +83,32 @@ static cell_t native_SetReadCallback(IPluginContext *p_context, const cell_t *pa
 
     cell_t data = params[4];
 
-    connection->set_read_callback([callback, hndl_websocket, p_context, data, callback_type](auto buffer, auto size)
+    connection->set_read_callback([connection, callback, hndl_websocket, p_context, data, callback_type](auto buffer, auto size)
                                   {
         std::string message(reinterpret_cast<const char*>(buffer), size);
         free(buffer);
 
-            g_RipExt.Defer([callback, hndl_websocket, message, p_context, data,callback_type]() {
+		if (!g_RipExt.Defer([callback, hndl_websocket, message, p_context, data,callback_type]() {
 			    callback->PushCell(hndl_websocket);
                 if(callback_type == WebSocket_JSON)
                 {
-                    json_t *object = json_loads(message.data(), 0, nullptr);
-			        Handle_t handle = handlesys->CreateHandle(htJSON, object, p_context->GetIdentity(), myself->GetIdentity(), nullptr);
-                    callback->PushCell(handle);
+                    json_error_t error;
+                    json_t *object = json_loads(message.data(), 0, &error);
+                    if(!object)
+                    {
+                        g_RipExt.LogError("WebSocket JSON parse failed: %s", error.text);
+                        callback->PushCell(BAD_HANDLE);
+                    }
+                    else
+                    {
+			            Handle_t handle = handlesys->CreateHandle(htJSON, object, p_context->GetIdentity(), myself->GetIdentity(), nullptr);
+                        if (handle == BAD_HANDLE)
+                        {
+                            json_decref(object);
+                            g_RipExt.LogError("WebSocket JSON handle creation failed.");
+                        }
+                        callback->PushCell(handle);
+                    }
                 }
                 else if(callback_type == Websocket_STRING)
                 {
@@ -102,7 +116,11 @@ static cell_t native_SetReadCallback(IPluginContext *p_context, const cell_t *pa
                 }
 			    callback->PushCell(data);
 			    callback->Execute(nullptr);
-            }); });
+            }))
+        {
+            g_RipExt.LogError("WebSocket read callback queue overflow; closing connection.");
+            connection->close();
+        } });
     return 1;
 }
 
@@ -125,11 +143,14 @@ static cell_t native_SetDisconnectCallback(IPluginContext *p_context, const cell
     cell_t data = params[3];
 
     connection->set_disconnect_callback([callback, hndl_websocket, p_context, data]()
-                                        { g_RipExt.Defer([callback, hndl_websocket, p_context, data]()
+                                        { if (!g_RipExt.Defer([callback, hndl_websocket, p_context, data]()
                                                          {
             callback->PushCell(hndl_websocket);
             callback->PushCell(data);
-            callback->Execute(nullptr); }); });
+            callback->Execute(nullptr); }))
+        {
+            g_RipExt.LogError("WebSocket disconnect callback dropped due to deferred queue overflow.");
+        } });
 
     return 1;
 }
@@ -152,12 +173,16 @@ static cell_t native_SetConnectCallback(IPluginContext *p_context, const cell_t 
 
     cell_t data = params[3];
 
-    connection->set_connect_callback([callback, hndl_websocket, p_context, data]()
-                                     { g_RipExt.Defer([callback, hndl_websocket, p_context, data]()
+    connection->set_connect_callback([connection, callback, hndl_websocket, p_context, data]()
+                                     { if (!g_RipExt.Defer([callback, hndl_websocket, p_context, data]()
                                                       {
             callback->PushCell(hndl_websocket);
             callback->PushCell(data);
-            callback->Execute(nullptr); }); });
+            callback->Execute(nullptr); }))
+        {
+            g_RipExt.LogError("WebSocket connect callback queue overflow; closing connection.");
+            connection->close();
+        } });
 
     return 1;
 }
@@ -281,8 +306,15 @@ static cell_t native_WebSocket(IPluginContext *p_context, const cell_t *params)
             p_context->ReportError("Failed to create WebSocket connection");
             return 0;
         }
+        Handle_t handle = handlesys->CreateHandle(htWebSocket, connection, p_context->GetIdentity(), myself->GetIdentity(), nullptr);
+        if (handle == BAD_HANDLE)
+        {
+            delete connection;
+            p_context->ReportError("Failed to create WebSocket handle");
+            return 0;
+        }
 
-        return handlesys->CreateHandle(htWebSocket, connection, p_context->GetIdentity(), myself->GetIdentity(), nullptr);
+        return handle;
     }
     catch (...)
     {

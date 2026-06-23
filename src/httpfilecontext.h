@@ -23,6 +23,7 @@
 #define SM_RIPEXT_HTTPFILECONTEXT_H_
 
 #include <stdio.h>
+#include <atomic>
 #include "extension.h"
 
 class HTTPFileContext : public IHTTPContext
@@ -37,14 +38,12 @@ public:
 public: // IHTTPContext
 	bool InitCurl();
 	void OnCompleted();
+	bool HasPendingCallbacks();
 	void setProgressData(curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
 
 private:
+	std::atomic<unsigned int> pendingCallbacks{0};
 	FILE *file = nullptr;
-	curl_off_t dltotal;
-	curl_off_t dlnow;
-	curl_off_t ultotal;
-	curl_off_t ulnow;
 
 	bool isUpload;
 	const std::string url;

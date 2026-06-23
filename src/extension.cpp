@@ -25,9 +25,15 @@
 #include "websocket_connection_base.h"
 #include "websocket_eventloop.h"
 #include <atomic>
+#include <mutex>
+#include <set>
 
-// Limit the max processing request per tick
+// SourcePawn and SourceMod handles/forwards must be touched from the game thread.
+// Keep all per-frame work bounded so network callbacks cannot stall the server tick.
 #define MAX_PROCESS 10
+#define MAX_COMPLETED_PROCESS 4
+#define MAX_DEFERRED_CALLBACKS_PER_FRAME 64
+#define MAX_DEFERRED_CALLBACKS_QUEUED 4096
 
 RipExt g_RipExt; /**< Global singleton for extension's main interface */
 
@@ -35,6 +41,16 @@ SMEXT_LINK(&g_RipExt);
 
 LockedQueue<IHTTPContext *> g_RequestQueue;
 LockedQueue<IHTTPContext *> g_CompletedRequestQueue;
+LockedQueue<IHTTPContext *> g_DeleteRequestQueue;
+LockedQueue<std::function<void()> *> g_DeferredCallbackQueue;
+
+std::mutex g_ActiveRequestMutex;
+std::set<IHTTPContext *> g_ActiveRequestContexts;
+std::mutex g_CurlContextMutex;
+std::set<CurlContext *> g_CurlContexts;
+
+std::atomic<unsigned int> g_DeferredCallbackCount{0};
+std::atomic<unsigned int> g_DroppedDeferredCallbacks{0};
 
 CURLM *g_Curl;
 uv_loop_t *g_Loop;
@@ -61,6 +77,30 @@ HandleType_t htWebSocket;
 
 std::atomic<bool> unloaded;
 
+static void TrackActiveRequest(IHTTPContext *context)
+{
+	std::lock_guard<std::mutex> guard(g_ActiveRequestMutex);
+	g_ActiveRequestContexts.insert(context);
+}
+
+static void UntrackActiveRequest(IHTTPContext *context)
+{
+	std::lock_guard<std::mutex> guard(g_ActiveRequestMutex);
+	g_ActiveRequestContexts.erase(context);
+}
+
+static void TrackCurlContext(CurlContext *context)
+{
+	std::lock_guard<std::mutex> guard(g_CurlContextMutex);
+	g_CurlContexts.insert(context);
+}
+
+static void UntrackCurlContext(CurlContext *context)
+{
+	std::lock_guard<std::mutex> guard(g_CurlContextMutex);
+	g_CurlContexts.erase(context);
+}
+
 static void CheckCompletedRequests()
 {
 	CURLMsg *message;
@@ -74,15 +114,217 @@ static void CheckCompletedRequests()
 		}
 
 		CURL *curl = message->easy_handle;
+		IHTTPContext *context = nullptr;
+		curl_easy_getinfo(curl, CURLINFO_PRIVATE, &context);
 		curl_multi_remove_handle(g_Curl, curl);
 
-		IHTTPContext *context;
-		curl_easy_getinfo(curl, CURLINFO_PRIVATE, &context);
+		if (context == nullptr)
+		{
+			continue;
+		}
+		UntrackActiveRequest(context);
 
 		g_CompletedRequestQueue.Lock();
 		g_CompletedRequestQueue.Push(context);
 		g_CompletedRequestQueue.Unlock();
 	}
+}
+
+static bool ReserveDeferredCallbackSlot()
+{
+	unsigned int current = g_DeferredCallbackCount.load(std::memory_order_relaxed);
+	while (current < MAX_DEFERRED_CALLBACKS_QUEUED)
+	{
+		if (g_DeferredCallbackCount.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void RunDeferredCallbacks()
+{
+	unsigned int dropped = g_DroppedDeferredCallbacks.exchange(0, std::memory_order_acq_rel);
+	if (dropped != 0 && !unloaded.load())
+	{
+		smutils->LogError(myself, "Dropped %u deferred callbacks to protect the server frame time.", dropped);
+	}
+
+	int count = 0;
+	while (count < MAX_DEFERRED_CALLBACKS_PER_FRAME)
+	{
+		g_DeferredCallbackQueue.Lock();
+		if (g_DeferredCallbackQueue.Empty())
+		{
+			g_DeferredCallbackQueue.Unlock();
+			break;
+		}
+
+		std::unique_ptr<std::function<void()>> callback(g_DeferredCallbackQueue.Pop());
+		g_DeferredCallbackCount.fetch_sub(1, std::memory_order_acq_rel);
+		g_DeferredCallbackQueue.Unlock();
+
+		if (!unloaded.load())
+		{
+			callback->operator()();
+		}
+
+		count++;
+	}
+}
+
+static void DeleteFailedRequests()
+{
+	int count = 0;
+	while (count < MAX_COMPLETED_PROCESS)
+	{
+		g_DeleteRequestQueue.Lock();
+		if (g_DeleteRequestQueue.Empty())
+		{
+			g_DeleteRequestQueue.Unlock();
+			break;
+		}
+
+		IHTTPContext *context = g_DeleteRequestQueue.Pop();
+		g_DeleteRequestQueue.Unlock();
+
+		if (context->HasPendingCallbacks())
+		{
+			g_DeleteRequestQueue.Lock();
+			g_DeleteRequestQueue.Push(context);
+			g_DeleteRequestQueue.Unlock();
+			break;
+		}
+
+		delete context;
+		count++;
+	}
+}
+
+static void RunCompletedRequests()
+{
+	int count = 0;
+	while (count < MAX_COMPLETED_PROCESS)
+	{
+		g_CompletedRequestQueue.Lock();
+		if (g_CompletedRequestQueue.Empty())
+		{
+			g_CompletedRequestQueue.Unlock();
+			break;
+		}
+
+		IHTTPContext *context = g_CompletedRequestQueue.Pop();
+		g_CompletedRequestQueue.Unlock();
+
+		context->OnCompleted();
+
+		if (context->HasPendingCallbacks())
+		{
+			g_DeleteRequestQueue.Lock();
+			g_DeleteRequestQueue.Push(context);
+			g_DeleteRequestQueue.Unlock();
+		}
+		else
+		{
+			delete context;
+		}
+		count++;
+	}
+}
+
+static void DrainDeferredCallbacks()
+{
+	while (true)
+	{
+		g_DeferredCallbackQueue.Lock();
+		if (g_DeferredCallbackQueue.Empty())
+		{
+			g_DeferredCallbackQueue.Unlock();
+			break;
+		}
+
+		std::unique_ptr<std::function<void()>> callback(g_DeferredCallbackQueue.Pop());
+		g_DeferredCallbackCount.fetch_sub(1, std::memory_order_acq_rel);
+		g_DeferredCallbackQueue.Unlock();
+	}
+}
+
+static void DrainRequestQueue(LockedQueue<IHTTPContext *> &queue)
+{
+	while (true)
+	{
+		queue.Lock();
+		if (queue.Empty())
+		{
+			queue.Unlock();
+			break;
+		}
+
+		IHTTPContext *context = queue.Pop();
+		queue.Unlock();
+		delete context;
+	}
+}
+
+static void CleanupActiveRequests()
+{
+	while (true)
+	{
+		g_ActiveRequestMutex.lock();
+		if (g_ActiveRequestContexts.empty())
+		{
+			g_ActiveRequestMutex.unlock();
+			break;
+		}
+
+		IHTTPContext *context = *g_ActiveRequestContexts.begin();
+		g_ActiveRequestContexts.erase(g_ActiveRequestContexts.begin());
+		g_ActiveRequestMutex.unlock();
+
+		if (context->curl)
+		{
+			curl_multi_remove_handle(g_Curl, context->curl);
+		}
+		delete context;
+	}
+}
+
+static void CleanupCurlContexts()
+{
+	while (true)
+	{
+		g_CurlContextMutex.lock();
+		if (g_CurlContexts.empty())
+		{
+			g_CurlContextMutex.unlock();
+			break;
+		}
+
+		CurlContext *context = *g_CurlContexts.begin();
+		g_CurlContexts.erase(g_CurlContexts.begin());
+		g_CurlContextMutex.unlock();
+
+		context->Destroy();
+	}
+}
+
+static void CloseLibuvHandle(uv_handle_t *handle)
+{
+	if (!uv_is_closing(handle))
+	{
+		uv_close(handle, nullptr);
+	}
+}
+
+static void CloseLibuvHandles()
+{
+	uv_timer_stop(&g_Timeout);
+	CloseLibuvHandle(reinterpret_cast<uv_handle_t *>(&g_Timeout));
+	CloseLibuvHandle(reinterpret_cast<uv_handle_t *>(&g_AsyncPerformRequests));
+	CloseLibuvHandle(reinterpret_cast<uv_handle_t *>(&g_AsyncStopLoop));
+	uv_run(g_Loop, UV_RUN_DEFAULT);
 }
 
 static void PerformRequests(uv_timer_t *handle)
@@ -124,6 +366,10 @@ static int CurlSocketCallback(CURL *curl, curl_socket_t socket, int action, void
 	case CURL_POLL_OUT:
 	case CURL_POLL_INOUT:
 		context = socketdata ? (CurlContext *)socketdata : new CurlContext(socket);
+		if (!socketdata)
+		{
+			TrackCurlContext(context);
+		}
 		curl_multi_assign(g_Curl, socket, context);
 
 		if (action != CURL_POLL_IN)
@@ -141,6 +387,7 @@ static int CurlSocketCallback(CURL *curl, curl_socket_t socket, int action, void
 		if (socketdata)
 		{
 			context = (CurlContext *)socketdata;
+			UntrackCurlContext(context);
 			context->Destroy();
 
 			curl_multi_assign(g_Curl, socket, nullptr);
@@ -175,26 +422,50 @@ static void EventLoop(void *data)
 
 static void AsyncPerformRequests(uv_async_t *handle)
 {
-	g_RequestQueue.Lock();
-	IHTTPContext *context;
-	// Limiter
 	int count = 0;
 
-	while (!g_RequestQueue.Empty() && count < MAX_PROCESS)
+	while (count < MAX_PROCESS)
 	{
-		context = g_RequestQueue.Pop();
+		g_RequestQueue.Lock();
+		if (g_RequestQueue.Empty())
+		{
+			g_RequestQueue.Unlock();
+			break;
+		}
+
+		IHTTPContext *context = g_RequestQueue.Pop();
+		g_RequestQueue.Unlock();
+		count++;
 
 		if (!context->InitCurl())
 		{
-			delete context;
+			g_DeleteRequestQueue.Lock();
+			g_DeleteRequestQueue.Push(context);
+			g_DeleteRequestQueue.Unlock();
 			continue;
 		}
 
-		curl_multi_add_handle(g_Curl, context->curl);
-		count++;
+		CURLMcode code = curl_multi_add_handle(g_Curl, context->curl);
+		if (code != CURLM_OK)
+		{
+			g_RipExt.LogError("Could not add cURL handle: %s", curl_multi_strerror(code));
+			g_DeleteRequestQueue.Lock();
+			g_DeleteRequestQueue.Push(context);
+			g_DeleteRequestQueue.Unlock();
+			continue;
+		}
+
+		TrackActiveRequest(context);
 	}
 
+	g_RequestQueue.Lock();
+	bool hasMoreRequests = !g_RequestQueue.Empty();
 	g_RequestQueue.Unlock();
+
+	if (hasMoreRequests && !unloaded.load())
+	{
+		uv_async_send(&g_AsyncPerformRequests);
+	}
 }
 
 static void AsyncStopLoop(uv_async_t *handle)
@@ -204,21 +475,18 @@ static void AsyncStopLoop(uv_async_t *handle)
 
 static void FrameHook(bool simulating)
 {
-	if (!g_RequestQueue.Empty())
+	g_RequestQueue.Lock();
+	bool hasRequests = !g_RequestQueue.Empty();
+	g_RequestQueue.Unlock();
+
+	if (hasRequests)
 	{
 		uv_async_send(&g_AsyncPerformRequests);
 	}
 
-	if (!g_CompletedRequestQueue.Empty())
-	{
-		g_CompletedRequestQueue.Lock();
-		IHTTPContext *context = g_CompletedRequestQueue.Pop();
-
-		context->OnCompleted();
-		delete context;
-
-		g_CompletedRequestQueue.Unlock();
-	}
+	RunDeferredCallbacks();
+	DeleteFailedRequests();
+	RunCompletedRequests();
 }
 
 bool RipExt::SDK_OnLoad(char *error, size_t maxlength, bool late)
@@ -238,6 +506,12 @@ bool RipExt::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	}
 
 	g_Curl = curl_multi_init();
+	if (g_Curl == nullptr)
+	{
+		curl_global_cleanup();
+		smutils->Format(error, maxlength, "%s", "Could not initialize cURL multi session.");
+		return false;
+	}
 	curl_multi_setopt(g_Curl, CURLMOPT_SOCKETFUNCTION, &CurlSocketCallback);
 	curl_multi_setopt(g_Curl, CURLMOPT_TIMERFUNCTION, &CurlTimeoutCallback);
 
@@ -292,13 +566,23 @@ bool RipExt::SDK_OnLoad(char *error, size_t maxlength, bool late)
 void RipExt::SDK_OnUnload()
 {
 	unloaded.store(true);
+	event_loop.OnExtUnload();
 
 	uv_async_send(&g_AsyncStopLoop);
 	uv_thread_join(&g_Thread);
-	uv_loop_close(g_Loop);
 
-	curl_multi_cleanup(&g_Curl);
+	DrainDeferredCallbacks();
+	CleanupActiveRequests();
+	DrainRequestQueue(g_RequestQueue);
+	DrainRequestQueue(g_CompletedRequestQueue);
+	DrainRequestQueue(g_DeleteRequestQueue);
+	CleanupCurlContexts();
+
+	curl_multi_cleanup(g_Curl);
 	curl_global_cleanup();
+
+	CloseLibuvHandles();
+	uv_loop_close(g_Loop);
 
 	handlesys->RemoveType(htHTTPRequest, myself->GetIdentity());
 	handlesys->RemoveType(htHTTPResponse, myself->GetIdentity());
@@ -307,8 +591,6 @@ void RipExt::SDK_OnUnload()
 	handlesys->RemoveType(htWebSocket, myself->GetIdentity());
 
 	smutils->RemoveGameFrameHook(&FrameHook);
-
-	event_loop.OnExtUnload();
 }
 
 void RipExt::AddRequestToQueue(IHTTPContext *context)
@@ -318,22 +600,34 @@ void RipExt::AddRequestToQueue(IHTTPContext *context)
 	g_RequestQueue.Unlock();
 }
 
-void log_msg(void *msg)
+static bool DeferLog(bool error, char *buffer)
 {
-	if (!unloaded.load())
+	if (!buffer)
 	{
-		smutils->LogMessage(myself, reinterpret_cast<char *>(msg));
+		return false;
 	}
-	free(msg);
-}
 
-void log_err(void *msg)
-{
-	if (!unloaded.load())
+	std::shared_ptr<char> msg(buffer, &free);
+	if (!g_RipExt.Defer([error, msg]() {
+		if (unloaded.load())
+		{
+			return;
+		}
+
+		if (error)
+		{
+			smutils->LogError(myself, msg.get());
+		}
+		else
+		{
+			smutils->LogMessage(myself, msg.get());
+		}
+	}))
 	{
-		smutils->LogError(myself, reinterpret_cast<char *>(msg));
+		return false;
 	}
-	free(msg);
+
+	return true;
 }
 
 void RipExt::LogMessage(const char *msg, ...)
@@ -344,12 +638,17 @@ void RipExt::LogMessage(const char *msg, ...)
 	}
 
 	char *buffer = reinterpret_cast<char *>(malloc(3072));
+	if (!buffer)
+	{
+		return;
+	}
+
 	va_list vp;
 	va_start(vp, msg);
 	vsnprintf(buffer, 3072, msg, vp);
 	va_end(vp);
 
-	smutils->AddFrameAction(&log_msg, reinterpret_cast<void *>(buffer));
+	DeferLog(false, buffer);
 }
 
 void RipExt::LogError(const char *msg, ...)
@@ -360,34 +659,37 @@ void RipExt::LogError(const char *msg, ...)
 	}
 
 	char *buffer = reinterpret_cast<char *>(malloc(3072));
+	if (!buffer)
+	{
+		return;
+	}
+
 	va_list vp;
 	va_start(vp, msg);
 	vsnprintf(buffer, 3072, msg, vp);
 	va_end(vp);
 
-	smutils->AddFrameAction(&log_err, reinterpret_cast<void *>(buffer));
+	DeferLog(true, buffer);
 }
 
-void execute_cb(void *cb)
+bool RipExt::Defer(std::function<void()> callback)
 {
-	std::unique_ptr<std::function<void()>> callback(reinterpret_cast<std::function<void()> *>(cb));
 	if (unloaded.load())
 	{
-		return;
+		return false;
 	}
 
-	callback->operator()();
-}
-
-void RipExt::Defer(std::function<void()> callback)
-{
-	if (unloaded.load())
+	if (!ReserveDeferredCallbackSlot())
 	{
-		return;
+		g_DroppedDeferredCallbacks.fetch_add(1, std::memory_order_acq_rel);
+		return false;
 	}
 
 	std::unique_ptr<std::function<void()>> cb = std::make_unique<std::function<void()>>(callback);
-	smutils->AddFrameAction(&execute_cb, cb.release());
+	g_DeferredCallbackQueue.Lock();
+	g_DeferredCallbackQueue.Push(cb.release());
+	g_DeferredCallbackQueue.Unlock();
+	return true;
 }
 
 void HTTPRequestHandler::OnHandleDestroy(HandleType_t type, void *object)
