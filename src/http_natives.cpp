@@ -627,6 +627,13 @@ static cell_t GetResponseData(IPluginContext *pContext, const cell_t *params)
 	/* Return the same handle every time we get the HTTP response data */
 	if (response->hndlData == BAD_HANDLE)
 	{
+		// 检查响应体是否存在（请求可能超时/失败）
+		if (response->body == nullptr || response->size == 0)
+		{
+			pContext->ReportError("No response body received (request may have failed or timed out)");
+			return BAD_HANDLE;
+		}
+
 		json_error_t error;
 		response->data = json_loads(response->body, 0, &error);
 		if (response->data == nullptr)
@@ -661,7 +668,9 @@ static cell_t GetResponseStr(IPluginContext *pContext, const cell_t *params)
 		return 0;
 	}
 
-	pContext->StringToLocalUTF8(params[2], params[3], response->body, nullptr);
+	// 如果没有响应体（请求失败/超时），返回空字符串而不是崩溃
+	const char *bodyStr = response->body ? response->body : "";
+	pContext->StringToLocalUTF8(params[2], params[3], bodyStr, nullptr);
 
 	return 1;
 }
