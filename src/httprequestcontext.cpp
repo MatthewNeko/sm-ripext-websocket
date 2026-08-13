@@ -35,7 +35,7 @@ static size_t ReadRequestBody(void *body, size_t size, size_t nmemb, void *userd
 
 static size_t WriteResponseBody(void *body, size_t size, size_t nmemb, void *userdata)
 {
-	if (nmemb != 0 && size > std::numeric_limits<size_t>::max() / nmemb)
+	if (nmemb != 0 && size > (std::numeric_limits<size_t>::max)() / nmemb)
 	{
 		return 0;
 	}
@@ -64,7 +64,7 @@ static size_t WriteResponseBody(void *body, size_t size, size_t nmemb, void *use
 
 static size_t ReceiveResponseHeader(char *buffer, size_t size, size_t nmemb, void *userdata)
 {
-	if (nmemb != 0 && size > std::numeric_limits<size_t>::max() / nmemb)
+	if (nmemb != 0 && size > (std::numeric_limits<size_t>::max)() / nmemb)
 	{
 		return 0;
 	}
