@@ -21,7 +21,7 @@ class websocket_connection_base
 {
 public:
     websocket_connection_base(std::string address, std::string endpoint, uint16_t port);
-    virtual ~websocket_connection_base() = default;
+    virtual ~websocket_connection_base();
     void set_write_callback(std::function<void(std::size_t)> callback);
     void set_read_callback(std::function<void(uint8_t *, std::size_t)> callback);
     void set_connect_callback(std::function<void()> callback);
@@ -29,6 +29,7 @@ public:
     void set_header(std::string key, std::string value);
     void add_headers(websocket::request_type &req);
     void destroy();
+    static void wait_for_all_destroyed();
     bool ws_open();
 
     virtual void close() = 0;

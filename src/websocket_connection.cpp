@@ -90,7 +90,9 @@ void websocket_connection::on_connect(beast::error_code ec, tcp::resolver::resul
     beast::get_lowest_layer(*this->ws).expires_never();
 
     auto timeout = websocket::stream_base::timeout::suggested(beast::role_type::client);
+    timeout.idle_timeout = std::chrono::seconds(60);
     timeout.keep_alive_pings = true;
+    this->ws->set_option(timeout);
     this->ws->set_option(websocket::stream_base::decorator([this](websocket::request_type &req)
                                                            { this->add_headers(req); }));
 

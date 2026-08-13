@@ -1,4 +1,5 @@
 #include "websocket_eventloop.h"
+#include "websocket_connection_base.h"
 
 websocket_eventloop event_loop;
 
@@ -11,7 +12,9 @@ void websocket_eventloop::OnExtLoad()
 
 void websocket_eventloop::OnExtUnload()
 {
-    // FIX: Properly stop and join the event loop thread
+    // Handles are removed before this method. Wait for cancelled completion
+    // handlers while the event loop is still running.
+    websocket_connection_base::wait_for_all_destroyed();
     running.store(false);
     this->context.stop();
     

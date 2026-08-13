@@ -49,6 +49,11 @@ HTTPFileContext::~HTTPFileContext()
 	forwards->ReleaseForward(forward);
 	forwards->ReleaseForward(progressForward);
 
+	if (file != nullptr)
+	{
+		fclose(file);
+		file = nullptr;
+	}
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 }
@@ -135,7 +140,11 @@ bool HTTPFileContext::InitCurl()
 
 void HTTPFileContext::OnCompleted()
 {
-	fclose(file);
+	if (file != nullptr)
+	{
+		fclose(file);
+		file = nullptr;
+	}
 
 	/* Return early if the plugin was unloaded while the thread was running */
 	if (forward->GetFunctionCount() == 0)

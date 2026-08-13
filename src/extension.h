@@ -33,9 +33,15 @@
 #include "smsdk_ext.h"
 #include <memory>
 #include <functional>
+#include <limits>
 
 #define SM_RIPEXT_CA_BUNDLE_PATH "configs/ripext/ca-bundle.crt"
 #define SM_RIPEXT_USER_AGENT "sm-ripext/" SMEXT_CONF_VERSION
+
+// Keep response buffering bounded. A response is accumulated in memory before
+// it is exposed to SourcePawn, so an untrusted endpoint must not be able to
+// grow the extension process without limit.
+inline constexpr size_t kMaxHttpResponseSize = 16 * 1024 * 1024;
 
 extern uv_loop_t *g_Loop;
 

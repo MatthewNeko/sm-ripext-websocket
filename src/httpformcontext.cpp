@@ -23,10 +23,20 @@
 
 static size_t WriteResponseBody(void *body, size_t size, size_t nmemb, void *userdata)
 {
+	if (nmemb != 0 && size > std::numeric_limits<size_t>::max() / nmemb)
+	{
+		return 0;
+	}
+
 	size_t total = size * nmemb;
 	struct HTTPResponse *response = (struct HTTPResponse *)userdata;
+	if (response->size > kMaxHttpResponseSize || total > kMaxHttpResponseSize - response->size)
+	{
+		return 0;
+	}
 
-	char *temp = (char *)realloc(response->body, response->size + total + 1);
+	size_t newSize = response->size + total;
+	char *temp = (char *)realloc(response->body, newSize + 1);
 	if (temp == nullptr)
 	{
 		return 0;
@@ -34,7 +44,7 @@ static size_t WriteResponseBody(void *body, size_t size, size_t nmemb, void *use
 
 	response->body = temp;
 	memcpy(&(response->body[response->size]), body, total);
-	response->size += total;
+	response->size = newSize;
 	response->body[response->size] = '\0';
 
 	return total;
@@ -42,24 +52,33 @@ static size_t WriteResponseBody(void *body, size_t size, size_t nmemb, void *use
 
 static size_t ReceiveResponseHeader(char *buffer, size_t size, size_t nmemb, void *userdata)
 {
+	if (nmemb != 0 && size > std::numeric_limits<size_t>::max() / nmemb)
+	{
+		return 0;
+	}
+
 	size_t total = size * nmemb;
 	struct HTTPResponse *response = (struct HTTPResponse *)userdata;
 
-	char header[CURL_MAX_HTTP_HEADER] = {'\0'};
-	strncat(header, buffer, total - 2); // Strip CRLF
+	size_t headerLength = total;
+	while (headerLength > 0 && (buffer[headerLength - 1] == '\r' || buffer[headerLength - 1] == '\n'))
+	{
+		headerLength--;
+	}
+	std::string header(buffer, headerLength);
 
-	const char *match = strstr(header, ": ");
-	if (match == nullptr)
+	size_t separator = header.find(": ");
+	if (separator == std::string::npos)
 	{
 		return total;
 	}
 
-	std::string name(header, match - header);
-	std::string value(match + 2);
+	std::string name = header.substr(0, separator);
+	std::string value = header.substr(separator + 2);
 
-	for (size_t i = 0; i < name.size(); i++)
+	for (char &character : name)
 	{
-		name[i] = tolower(name[i]);
+		character = static_cast<char>(tolower(static_cast<unsigned char>(character)));
 	}
 
 	response->headers.replace(name.c_str(), std::move(value));

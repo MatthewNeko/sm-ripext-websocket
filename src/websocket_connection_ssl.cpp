@@ -126,6 +126,7 @@ void websocket_connection_ssl::on_ssl_handshake(beast::error_code ec)
     beast::get_lowest_layer(*this->ws).expires_never();
 
     auto timeout = websocket::stream_base::timeout::suggested(beast::role_type::client);
+    timeout.idle_timeout = std::chrono::seconds(60);
     timeout.keep_alive_pings = true;
     this->ws->set_option(timeout);
     // All the callbacks in this class use `this` as a pointer instead of the smart pointer.

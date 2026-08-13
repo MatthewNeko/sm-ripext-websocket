@@ -1,8 +1,28 @@
 #include "websocket_connection_base.h"
+#include <condition_variable>
+#include <set>
+
+namespace
+{
+std::mutex g_connection_mutex;
+std::set<websocket_connection_base *> g_connections;
+std::condition_variable g_connection_condition;
+}
 
 websocket_connection_base::websocket_connection_base(std::string address, std::string endpoint, uint16_t port)
     : address(std::move(address)), endpoint(std::move(endpoint)), port(port)
 {
+    std::lock_guard<std::mutex> guard(g_connection_mutex);
+    g_connections.insert(this);
+}
+
+websocket_connection_base::~websocket_connection_base()
+{
+    {
+        std::lock_guard<std::mutex> guard(g_connection_mutex);
+        g_connections.erase(this);
+    }
+    g_connection_condition.notify_all();
 }
 
 void websocket_connection_base::set_write_callback(std::function<void(size_t)> callback)
@@ -46,6 +66,13 @@ void websocket_connection_base::destroy()
     this->pending_delete.store(true, std::memory_order_release);
     this->cancel();
     this->maybe_delete();
+}
+
+void websocket_connection_base::wait_for_all_destroyed()
+{
+    std::unique_lock<std::mutex> lock(g_connection_mutex);
+    g_connection_condition.wait(lock, []()
+                                { return g_connections.empty(); });
 }
 
 bool websocket_connection_base::ws_open()

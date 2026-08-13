@@ -566,6 +566,10 @@ bool RipExt::SDK_OnLoad(char *error, size_t maxlength, bool late)
 void RipExt::SDK_OnUnload()
 {
 	unloaded.store(true);
+	// Destroy WebSocket handles while the event loop is still alive so cancel()
+	// can dispatch completion handlers. OnExtUnload waits for those handlers before
+	// stopping the event loop.
+	handlesys->RemoveType(htWebSocket, myself->GetIdentity());
 	event_loop.OnExtUnload();
 
 	uv_async_send(&g_AsyncStopLoop);
@@ -588,7 +592,6 @@ void RipExt::SDK_OnUnload()
 	handlesys->RemoveType(htHTTPResponse, myself->GetIdentity());
 	handlesys->RemoveType(htJSON, myself->GetIdentity());
 	handlesys->RemoveType(htJSONObjectKeys, myself->GetIdentity());
-	handlesys->RemoveType(htWebSocket, myself->GetIdentity());
 
 	smutils->RemoveGameFrameHook(&FrameHook);
 }
