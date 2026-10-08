@@ -556,6 +556,10 @@ bool RipExt::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	smutils->AddGameFrameHook(&FrameHook);
 	smutils->BuildPath(Path_SM, caBundlePath, sizeof(caBundlePath), SM_RIPEXT_CA_BUNDLE_PATH);
 
+
+	// WebSocket SSL must use the same CA bundle as cURL (see ws_ext issue on
+	// Windows where set_default_verify_paths points to a nonexistent path).
+	event_loop.load_ca_bundle(caBundlePath);
 	event_loop.OnExtLoad();
 
 	unloaded.store(false);
